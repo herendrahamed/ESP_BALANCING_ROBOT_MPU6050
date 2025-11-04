@@ -1,0 +1,258 @@
+/*
+ * Program MPU6050 ESP-IDF untuk Pitch & Roll
+ *
+ * Fitur:
+ * - Inisialisasi I2C
+ * - Kalibrasi offset Giroskop saat startup.
+ * - Inisialisasi (priming) sudut awal dari Akselerometer.
+ * - Loop utama dengan Complementary Filter (ALPHA = 0.98)
+ * - Output data diformat untuk logging (misal: MATLAB).
+ */
+
+#include <stdio.h>
+#include <math.h> // Diperlukan untuk atan2 dan sqrt
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2c.h"
+#include "esp_log.h"
+#include "esp_timer.h" // Diperlukan untuk delta time (dt)
+
+// --- Konfigurasi Hardware & I2C ---
+#define I2C_MASTER_SCL_IO           32          // Ganti dengan pin SCL Anda
+#define I2C_MASTER_SDA_IO           33          // Ganti dengan pin SDA Anda
+#define I2C_MASTER_NUM              I2C_NUM_0   // Port I2C
+#define I2C_MASTER_FREQ_HZ          400000      // 400kHz Fast Mode
+#define I2C_MASTER_TX_BUF_DISABLE   0
+#define I2C_MASTER_RX_BUF_DISABLE   0
+
+// --- Konfigurasi MPU6050 ---
+/* * CATATAN PENTING:
+ * Alamat MPU6050 standar adalah 0x68 (AD0 = LOW).
+ * Anda menggunakan 0x69, yang berarti pin AD0 Anda terhubung ke HIGH (VDD).
+ * Pastikan ini sesuai dengan hardware Anda.
+ */
+#define MPU6050_SENSOR_ADDR         0x69
+#define MPU6050_PWR_MGMT_1          0x6B
+#define MPU6050_ACCEL_XOUT_H        0x3B
+#define MPU6050_GYRO_XOUT_H         0x43
+
+// --- Konfigurasi Filter & Konstanta ---
+#define M_PI 3.14159265358979323846
+#define ALPHA 0.98  // Faktor filter: 98% dari Gyro, 2% dari Accel
+#define ACCEL_SCALE_FACTOR 16384.0 // Untuk Skala Default ±2g
+#define GYRO_SCALE_FACTOR  131.0   // Untuk Skala Default ±250dps
+
+// --- Variabel Global ---
+static const char *TAG = "mpu6050";
+
+// Variabel offset kalibrasi (diset oleh mpu6050_calibrate_gyro)
+float gyro_x_offset = 0.0;
+float gyro_y_offset = 0.0;
+float gyro_z_offset = 0.0;
+
+// Variabel sudut global (diset oleh priming & diupdate di loop)
+float angle_pitch = 0.0;
+float angle_roll = 0.0;
+// float angle_yaw = 0.0; // Yaw tidak akurat tanpa magnetometer
+
+/**
+ * @brief Inisialisasi I2C Master
+ */
+static esp_err_t i2c_master_init(void)
+{
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+    };
+    esp_err_t err = i2c_param_config(I2C_MASTER_NUM, &conf);
+    if (err != ESP_OK) return err;
+    return i2c_driver_install(I2C_MASTER_NUM, conf.mode, 
+                              I2C_MASTER_RX_BUF_DISABLE, 
+                              I2C_MASTER_TX_BUF_DISABLE, 0);
+}
+
+/**
+ * @brief Tulis satu byte ke register MPU6050
+ */
+static esp_err_t mpu6050_write_byte(uint8_t reg_addr, uint8_t data)
+{
+    uint8_t write_buf[2] = {reg_addr, data};
+    return i2c_master_write_to_device(I2C_MASTER_NUM, MPU6050_SENSOR_ADDR, 
+                                      write_buf, sizeof(write_buf), 
+                                      pdMS_TO_TICKS(1000));
+}
+
+/**
+ * @brief Membaca beberapa byte dari MPU6050
+ */
+static esp_err_t mpu6050_read_bytes(uint8_t reg_start, uint8_t *data_buf, uint8_t len)
+{
+    return i2c_master_write_read_device(I2C_MASTER_NUM, MPU6050_SENSOR_ADDR, 
+                                        &reg_start, 1, 
+                                        data_buf, len, 
+                                        pdMS_TO_TICKS(1000));
+}
+
+/**
+ * @brief Menggabungkan 2 byte (High dan Low) menjadi 16-bit signed integer
+ */
+static inline int16_t combine_bytes(uint8_t high, uint8_t low)
+{
+    return (int16_t)((high << 8) | low);
+}
+
+/**
+ * @brief Kalibrasi Giroskop dengan mengambil rata-rata N sampel.
+ * PENTING: Robot harus dalam keadaan diam total saat fungsi ini dipanggil!
+ */
+static void mpu6050_calibrate_gyro(int num_samples)
+{
+    ESP_LOGI(TAG, "Mulai Kalibrasi Giroskop... Jaga robot tetap diam!");
+    long _gx_offset_sum = 0;
+    long _gy_offset_sum = 0;
+    long _gz_offset_sum = 0;
+    uint8_t gyro_data[6];
+    
+    for (int i = 0; i < num_samples; i++)
+    {
+        mpu6050_read_bytes(MPU6050_GYRO_XOUT_H, gyro_data, 6);
+        _gx_offset_sum += combine_bytes(gyro_data[0], gyro_data[1]);
+        _gy_offset_sum += combine_bytes(gyro_data[2], gyro_data[3]);
+        _gz_offset_sum += combine_bytes(gyro_data[4], gyro_data[5]);
+        vTaskDelay(pdMS_TO_TICKS(3)); // delay kecil antar sampel
+    }
+
+    gyro_x_offset = (float)_gx_offset_sum / num_samples;
+    gyro_y_offset = (float)_gy_offset_sum / num_samples;
+    gyro_z_offset = (float)_gz_offset_sum / num_samples;
+
+    ESP_LOGI(TAG, "Kalibrasi Selesai. Offset:");
+    ESP_LOGI(TAG, "X: %.2f, Y: %.2f, Z: %.2f", gyro_x_offset, gyro_y_offset, gyro_z_offset);
+}
+
+// =========================================================================
+//                             FUNGSI UTAMA
+// =========================================================================
+
+void app_main(void)
+{
+    // --- Deklarasi Variabel Lokal ---
+    
+    // Variabel untuk data sensor raw
+    uint8_t sensor_data[14]; // Buffer untuk bacaan 14 byte (Accel + Temp + Gyro)
+    uint8_t accel_data[6];   // Buffer untuk priming akselerometer
+    int16_t ax, ay, az;      // Nilai raw akselerometer
+    int16_t gx, gy, gz;      // Nilai raw giroskop
+
+    // Variabel untuk priming/inisialisasi filter
+    float initial_pitch_sum = 0.0;
+    float initial_roll_sum = 0.0;
+    const int num_avg_samples = 100; // Jml sampel untuk priming
+    
+    // Variabel untuk kalkulasi filter di loop
+    float accel_pitch_local = 0.0; // Sudut dari accel
+    float accel_roll_local = 0.0;
+    float gyro_pitch_rate = 0.0;   // Kecepatan sudut dari gyro
+    float gyro_roll_rate = 0.0;
+
+    // Variabel untuk timing (delta time)
+    int64_t last_time;
+    float dt;
+
+    // --- 1. Inisialisasi I2C ---
+    ESP_ERROR_CHECK(i2c_master_init());
+    ESP_LOGI(TAG, "I2C initialized successfully");
+
+    // --- 2. Bangunkan MPU6050 ---
+    ESP_ERROR_CHECK(mpu6050_write_byte(MPU6050_PWR_MGMT_1, 0x00));
+    ESP_LOGI(TAG, "MPU6050 woken up successfully");
+    vTaskDelay(pdMS_TO_TICKS(100)); // Tunggu sensor stabil
+
+    // --- 3. Kalibrasi Giroskop ---
+    // WAJIB: Menghilangkan drift giroskop saat diam
+    mpu6050_calibrate_gyro(1000); 
+
+    // --- 4. Inisialisasi Sudut Filter (Priming) ---
+    // Mengatur sudut awal filter berdasarkan bacaan akselerometer
+    // agar robot tidak "jatuh" saat filter pertama kali berjalan.
+    ESP_LOGI(TAG, "Menginisialisasi sudut awal (Priming filter)...");
+    
+    for (int i = 0; i < num_avg_samples; i++)
+    {
+        // Kita hanya perlu data akselerometer (6 byte dari 0x3B)
+        ESP_ERROR_CHECK(mpu6050_read_bytes(MPU6050_ACCEL_XOUT_H, accel_data, 6));
+        
+        ax = combine_bytes(accel_data[0], accel_data[1]);
+        ay = combine_bytes(accel_data[2], accel_data[3]);
+        az = combine_bytes(accel_data[4], accel_data[5]);
+
+        // Gunakan formula yang sama dengan di loop utama (pitch dibalik)
+        initial_pitch_sum += -(atan2(az, ax) * 180.0 / M_PI);
+        initial_roll_sum  +=  (atan2(ay, ax) * 180.0 / M_PI);
+        
+        vTaskDelay(pdMS_TO_TICKS(5)); // Jeda singkat antar pembacaan
+    }
+
+    // Set variabel filter global dengan nilai rata-rata awal
+    angle_pitch = initial_pitch_sum / num_avg_samples;
+    angle_roll = initial_roll_sum / num_avg_samples;
+
+    ESP_LOGI(TAG, "Inisialisasi selesai. Pitch awal: %.2f°, Roll awal: %.2f°", 
+             angle_pitch, angle_roll);
+
+
+    // --- 5. Mulai Loop Utama ---
+    last_time = esp_timer_get_time(); // Inisialisasi timer
+    ESP_LOGI(TAG, "Memulai loop utama & streaming data...");
+
+    while (1) 
+    {
+        // Hitung Delta Time (dt)
+        int64_t current_time = esp_timer_get_time();
+        dt = (float)(current_time - last_time) / 1000000.0; // dt dalam detik
+        last_time = current_time;
+
+        // Baca 14 byte sekaligus (Accel, Temp, Gyro)
+        esp_err_t ret = mpu6050_read_bytes(MPU6050_ACCEL_XOUT_H, sensor_data, 14);
+
+        if (ret == ESP_OK)
+        {
+            // 1. Dapatkan Nilai Raw
+            ax = combine_bytes(sensor_data[0], sensor_data[1]);
+            ay = combine_bytes(sensor_data[2], sensor_data[3]);
+            az = combine_bytes(sensor_data[4], sensor_data[5]);
+            // Lewati data temperatur (sensor_data[6] & [7])
+            gx = combine_bytes(sensor_data[8], sensor_data[9]);
+            gy = combine_bytes(sensor_data[10], sensor_data[11]);
+            gz = combine_bytes(sensor_data[12], sensor_data[13]);
+
+            // 2. Hitung Sudut dari Akselerometer (Koreksi Jangka Panjang)
+            // (Formula untuk orientasi X-Up dan pitch dibalik)
+            accel_pitch_local = -(atan2(az, ax) * 180.0 / M_PI);
+            accel_roll_local  =  (atan2(ay, ax) * 180.0 / M_PI);
+
+            // 3. Hitung Laju Rotasi dari Giroskop (Input Jangka Pendek)
+            // (Gunakan offset kalibrasi dan balik pitch)
+            gyro_pitch_rate = -((gy - gyro_y_offset) / GYRO_SCALE_FACTOR);
+            gyro_roll_rate  =  ((gz - gyro_z_offset) / GYRO_SCALE_FACTOR);
+
+            // 4. Terapkan Complementary Filter
+            // Sudut = 98% * (Sudut lama + Perubahan Gyro) + 2% * (Sudut Akselerometer)
+            angle_pitch = ALPHA * (angle_pitch + gyro_pitch_rate * dt) + (1.0 - ALPHA) * accel_pitch_local;
+            angle_roll  = ALPHA * (angle_roll + gyro_roll_rate * dt)  + (1.0 - ALPHA) * accel_roll_local;
+
+            // 5. Cetak hasil akhir (format untuk logging MATLAB/Serial Plotter)
+            printf("%.4f,%.4f\n", angle_pitch, angle_roll);
+
+        } else {
+            ESP_LOGE(TAG, "Gagal membaca data dari MPU6050");
+        }
+
+        // Delay 5ms (menghasilkan loop rate ~200 Hz)
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
